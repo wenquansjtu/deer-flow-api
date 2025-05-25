@@ -398,6 +398,8 @@ if __name__ == "__main__":
             port=args.port,
             reload=reload,
             log_level=args.log_level,
+            timeout_keep_alive=300,  # Keep connections alive for 5 minutes
+            timeout_graceful_shutdown=30,  # Allow 30 seconds for graceful shutdown
         )
         
         server = CustomServer(config)

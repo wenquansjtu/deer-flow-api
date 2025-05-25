@@ -105,6 +105,7 @@ async def _astream_workflow_generator(
             "max_step_num": max_step_num,
             "max_search_results": max_search_results,
             "mcp_settings": mcp_settings,
+            "recursion_limit": 100,
         },
         stream_mode=["messages", "updates"],
         subgraphs=True,
