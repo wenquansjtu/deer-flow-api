@@ -33,11 +33,11 @@ def patch_futures_dict():
         
         original_on_done = FuturesDict.on_done
         
-        def safe_on_done(self, fut):
+        def safe_on_done(self, task, exception):
             """Safe version of on_done that handles None callbacks."""
             try:
                 if self.callback is not None and callable(self.callback):
-                    return original_on_done(self, fut)
+                    return original_on_done(self, task, exception)
                 else:
                     # If callback is None or not callable, just log and return
                     logger.debug("Skipping None or non-callable callback in FuturesDict.on_done")
