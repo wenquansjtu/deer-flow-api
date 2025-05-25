@@ -6,10 +6,12 @@ Server script for running the DeerFlow API.
 """
 
 import argparse
+import asyncio
 import logging
 import signal
 import sys
 import uvicorn
+from src.server import app
 
 # Configure logging
 logging.basicConfig(
@@ -19,12 +21,46 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# Global flag to track shutdown state
+is_shutting_down = False
+
+async def cleanup():
+    """Cleanup function to handle graceful shutdown"""
+    logger.info("Starting cleanup...")
+    # Get all running tasks
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    
+    # Cancel all tasks
+    for task in tasks:
+        task.cancel()
+    
+    logger.info(f"Cancelling {len(tasks)} outstanding tasks")
+    await asyncio.gather(*tasks, return_exceptions=True)
+    logger.info("Cleanup completed")
 
 def handle_shutdown(signum, frame):
     """Handle graceful shutdown on SIGTERM/SIGINT"""
+    global is_shutting_down
+    if is_shutting_down:
+        logger.warning("Received second shutdown signal, forcing exit...")
+        sys.exit(1)
+        
+    is_shutting_down = True
     logger.info("Received shutdown signal. Starting graceful shutdown...")
-    sys.exit(0)
-
+    
+    try:
+        # Get the event loop
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Schedule the cleanup
+            loop.create_task(cleanup())
+        else:
+            # If loop is not running, run cleanup directly
+            loop.run_until_complete(cleanup())
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
+    finally:
+        sys.exit(0)
 
 # Register signal handlers
 signal.signal(signal.SIGTERM, handle_shutdown)
