@@ -11,6 +11,7 @@ import logging
 import signal
 import sys
 import uvicorn
+import weakref
 from src.server import app
 from src.graph.builder import build_graph_with_memory
 from contextlib import suppress
@@ -36,9 +37,22 @@ def patch_futures_dict():
             try:
                 # Check if callback exists and is callable
                 if hasattr(self, 'callback') and self.callback is not None and callable(self.callback):
-                    # Call the callback safely
+                    # Call the callback safely with proper argument handling
                     try:
-                        self.callback(task, exception)
+                        # Check if it's a WeakMethod or similar that only takes one argument
+                        if isinstance(self.callback, weakref.WeakMethod):
+                            # WeakMethod typically only takes the task
+                            self.callback(task)
+                        else:
+                            # Try with both arguments first
+                            try:
+                                self.callback(task, exception)
+                            except TypeError as te:
+                                # If that fails, try with just the task
+                                if "takes 1 positional argument but" in str(te):
+                                    self.callback(task)
+                                else:
+                                    raise te
                     except Exception as callback_error:
                         logger.error(f"Error in callback execution: {callback_error}")
                 else:
