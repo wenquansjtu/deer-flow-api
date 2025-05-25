@@ -39,26 +39,26 @@ def patch_futures_dict():
                 if hasattr(self, 'callback') and self.callback is not None and callable(self.callback):
                     # Call the callback safely with proper argument handling
                     try:
-                        # Check if it's a WeakMethod or similar that only takes one argument
-                        if isinstance(self.callback, weakref.WeakMethod):
-                            # WeakMethod typically only takes the task
+                        # Always try single argument first (most common case)
+                        try:
                             self.callback(task)
-                        else:
-                            # For other callback types, try different argument patterns
-                            try:
-                                # First try with task and exception
-                                self.callback(task, exception)
-                            except TypeError as te:
-                                # If that fails, try with just the task
-                                if "positional argument" in str(te):
-                                    self.callback(task)
-                                else:
-                                    # Try calling with no arguments
+                            logger.debug("Successfully called callback with task only")
+                        except TypeError as te:
+                            # If single argument fails, try with both arguments
+                            if "positional argument" in str(te) or "takes 1" in str(te):
+                                try:
+                                    self.callback(task, exception)
+                                    logger.debug("Successfully called callback with task and exception")
+                                except TypeError as te2:
+                                    # If both fail, try with no arguments
                                     try:
                                         self.callback()
+                                        logger.debug("Successfully called callback with no arguments")
                                     except TypeError:
-                                        # If all else fails, just log the error
-                                        logger.error(f"Could not determine callback signature: {te}")
+                                        logger.error(f"Could not determine callback signature. Single arg error: {te}, Double arg error: {te2}")
+                            else:
+                                # Re-raise if it's not an argument count issue
+                                raise te
                     except Exception as callback_error:
                         logger.error(f"Error in callback execution: {callback_error}")
                 else:
