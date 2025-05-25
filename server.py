@@ -38,36 +38,53 @@ def patch_futures_dict():
         def safe_on_done(self, task, exception):
             """Safe version of on_done that handles None callbacks gracefully."""
             try:
-                # Check if callback exists and is callable
-                if hasattr(self, 'callback') and self.callback is not None and callable(self.callback):
-                    # Try to call the original method first
-                    try:
-                        return original_on_done(self, task, exception)
-                    except TypeError as te:
-                        # Only if we get a TypeError, try our fallback logic
-                        if "positional argument" in str(te) or "takes 1" in str(te):
-                            logger.debug(f"Callback signature issue, trying fallback: {te}")
-                            try:
-                                # Try single argument (for WeakMethod)
-                                self.callback(task)
-                                logger.debug("Successfully called callback with task only")
-                                return None
-                            except TypeError:
-                                try:
-                                    # Try no arguments
-                                    self.callback()
-                                    logger.debug("Successfully called callback with no arguments")
-                                    return None
-                                except TypeError as final_error:
-                                    logger.error(f"Could not call callback with any signature: {final_error}")
-                                    return None
-                        else:
-                            # Re-raise if it's not an argument issue
-                            raise te
-                else:
-                    # If callback is None or not callable, just log and return
-                    logger.debug("Skipping None or non-callable callback in FuturesDict.on_done")
+                # First check if callback is None to avoid the original error
+                if not hasattr(self, 'callback') or self.callback is None:
+                    logger.debug("Callback is None, skipping")
                     return None
+                
+                # Check if callback is callable
+                if not callable(self.callback):
+                    logger.debug("Callback is not callable, skipping")
+                    return None
+                
+                # Now we know callback exists and is callable, try original method
+                try:
+                    return original_on_done(self, task, exception)
+                except TypeError as te:
+                    # Only if we get a TypeError, try our fallback logic
+                    if "positional argument" in str(te) or "takes 1" in str(te):
+                        logger.debug(f"Callback signature issue, trying fallback: {te}")
+                        try:
+                            # Try single argument (for WeakMethod)
+                            self.callback(task)
+                            logger.debug("Successfully called callback with task only")
+                            return None
+                        except TypeError:
+                            try:
+                                # Try no arguments
+                                self.callback()
+                                logger.debug("Successfully called callback with no arguments")
+                                return None
+                            except TypeError as final_error:
+                                logger.error(f"Could not call callback with any signature: {final_error}")
+                                return None
+                    else:
+                        # Re-raise if it's not an argument issue
+                        raise te
+                except Exception as original_error:
+                    # If original method fails for other reasons, try direct callback
+                    if "'NoneType' object is not callable" in str(original_error):
+                        logger.debug("Original method failed with NoneType error, trying direct callback")
+                        try:
+                            self.callback(task)
+                            return None
+                        except Exception as callback_error:
+                            logger.error(f"Direct callback also failed: {callback_error}")
+                            return None
+                    else:
+                        # Re-raise other exceptions
+                        raise original_error
                     
             except Exception as e:
                 logger.error(f"Error in FuturesDict.on_done: {e}")
