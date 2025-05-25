@@ -32,47 +32,48 @@ def patch_futures_dict():
     try:
         from langgraph.pregel.runner import FuturesDict
         
+        # Store the original method
+        original_on_done = FuturesDict.on_done
+        
         def safe_on_done(self, task, exception):
-            """Safe version of on_done that handles None callbacks."""
+            """Safe version of on_done that handles None callbacks gracefully."""
             try:
                 # Check if callback exists and is callable
                 if hasattr(self, 'callback') and self.callback is not None and callable(self.callback):
-                    # Call the callback safely with proper argument handling
+                    # Try to call the original method first
                     try:
-                        # Always try single argument first (most common case)
-                        try:
-                            self.callback(task)
-                            logger.debug("Successfully called callback with task only")
-                        except TypeError as te:
-                            # If single argument fails, try with both arguments
-                            if "positional argument" in str(te) or "takes 1" in str(te):
+                        return original_on_done(self, task, exception)
+                    except TypeError as te:
+                        # Only if we get a TypeError, try our fallback logic
+                        if "positional argument" in str(te) or "takes 1" in str(te):
+                            logger.debug(f"Callback signature issue, trying fallback: {te}")
+                            try:
+                                # Try single argument (for WeakMethod)
+                                self.callback(task)
+                                logger.debug("Successfully called callback with task only")
+                                return None
+                            except TypeError:
                                 try:
-                                    self.callback(task, exception)
-                                    logger.debug("Successfully called callback with task and exception")
-                                except TypeError as te2:
-                                    # If both fail, try with no arguments
-                                    try:
-                                        self.callback()
-                                        logger.debug("Successfully called callback with no arguments")
-                                    except TypeError:
-                                        logger.error(f"Could not determine callback signature. Single arg error: {te}, Double arg error: {te2}")
-                            else:
-                                # Re-raise if it's not an argument count issue
-                                raise te
-                    except Exception as callback_error:
-                        logger.error(f"Error in callback execution: {callback_error}")
+                                    # Try no arguments
+                                    self.callback()
+                                    logger.debug("Successfully called callback with no arguments")
+                                    return None
+                                except TypeError as final_error:
+                                    logger.error(f"Could not call callback with any signature: {final_error}")
+                                    return None
+                        else:
+                            # Re-raise if it's not an argument issue
+                            raise te
                 else:
                     # If callback is None or not callable, just log and return
                     logger.debug("Skipping None or non-callable callback in FuturesDict.on_done")
-                    
-                # Always return None to prevent further issues
-                return None
+                    return None
                     
             except Exception as e:
                 logger.error(f"Error in FuturesDict.on_done: {e}")
                 return None
         
-        # Replace the method entirely
+        # Replace the method
         FuturesDict.on_done = safe_on_done
         logger.info("Successfully patched FuturesDict.on_done")
         
