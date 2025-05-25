@@ -82,6 +82,12 @@ async def cleanup_langgraph_task(task):
             if hasattr(coro, 'cr_frame') and hasattr(coro.cr_frame, 'f_locals'):
                 locals_dict = coro.cr_frame.f_locals
                 
+                # Try to safely handle any FuturesDict callbacks
+                if 'futures_dict' in locals_dict:
+                    futures_dict = locals_dict['futures_dict']
+                    if hasattr(futures_dict, 'callbacks'):
+                        futures_dict.callbacks.clear()
+                
                 # 尝试获取和清理所有可能的回调管理器
                 managers_to_cleanup = []
                 
