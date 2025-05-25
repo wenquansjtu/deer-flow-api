@@ -70,6 +70,23 @@ async def cleanup_callback_manager(run_manager: Any) -> None:
     except Exception as e:
         logger.error(f"Error accessing callback manager: {e}")
 
+async def safe_cleanup_futures_dict(futures_dict):
+    """Safely clean up a FuturesDict instance."""
+    try:
+        if hasattr(futures_dict, 'callback'):
+            futures_dict.callback = None
+        if hasattr(futures_dict, 'callbacks'):
+            futures_dict.callbacks.clear()
+        if hasattr(futures_dict, '_done_callbacks'):
+            futures_dict._done_callbacks.clear()
+        # Cancel any pending futures
+        if hasattr(futures_dict, '_futures'):
+            for fut in futures_dict._futures:
+                if not fut.done():
+                    fut.cancel()
+    except Exception as e:
+        logger.error(f"Error cleaning up FuturesDict: {e}")
+
 async def cleanup_langgraph_task(task):
     """Specially handle langgraph task cleanup."""
     if task.done():
@@ -82,11 +99,25 @@ async def cleanup_langgraph_task(task):
             if hasattr(coro, 'cr_frame') and hasattr(coro.cr_frame, 'f_locals'):
                 locals_dict = coro.cr_frame.f_locals
                 
-                # Try to safely handle any FuturesDict callbacks
+                # Handle FuturesDict instances more comprehensively
+                futures_dict_candidates = []
+                
+                # Direct FuturesDict instance
                 if 'futures_dict' in locals_dict:
-                    futures_dict = locals_dict['futures_dict']
-                    if hasattr(futures_dict, 'callbacks'):
-                        futures_dict.callbacks.clear()
+                    futures_dict_candidates.append(locals_dict['futures_dict'])
+                
+                # Look for FuturesDict in task attributes
+                if hasattr(task, '_futures_dict'):
+                    futures_dict_candidates.append(task._futures_dict)
+                
+                # Look for FuturesDict in task state
+                if hasattr(task, 'state') and hasattr(task.state, 'futures_dict'):
+                    futures_dict_candidates.append(task.state.futures_dict)
+                
+                # Clean up all found FuturesDict instances
+                for futures_dict in futures_dict_candidates:
+                    if futures_dict is not None:
+                        await safe_cleanup_futures_dict(futures_dict)
                 
                 # 尝试获取和清理所有可能的回调管理器
                 managers_to_cleanup = []
