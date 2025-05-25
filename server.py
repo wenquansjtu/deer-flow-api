@@ -17,6 +17,38 @@ from contextlib import suppress
 from functools import partial
 from typing import Any, Dict, Optional
 
+# Monkey patch to fix FuturesDict callback issue
+def patch_futures_dict():
+    """Patch FuturesDict to handle None callbacks gracefully."""
+    try:
+        from langgraph.pregel.runner import FuturesDict
+        
+        original_on_done = FuturesDict.on_done
+        
+        def safe_on_done(self, fut):
+            """Safe version of on_done that handles None callbacks."""
+            try:
+                if self.callback is not None and callable(self.callback):
+                    return original_on_done(self, fut)
+                else:
+                    # If callback is None or not callable, just log and return
+                    logger.debug("Skipping None or non-callable callback in FuturesDict.on_done")
+                    return
+            except Exception as e:
+                logger.error(f"Error in FuturesDict.on_done: {e}")
+                return
+        
+        FuturesDict.on_done = safe_on_done
+        logger.info("Successfully patched FuturesDict.on_done")
+        
+    except ImportError as e:
+        logger.warning(f"Could not patch FuturesDict: {e}")
+    except Exception as e:
+        logger.error(f"Error patching FuturesDict: {e}")
+
+# Apply the patch early
+patch_futures_dict()
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -34,14 +66,32 @@ async def cancel_task_with_cleanup(task):
     if task.done():
         return
     
-    with suppress(asyncio.CancelledError):
+    try:
         task.cancel()
-        try:
-            await asyncio.wait_for(task, timeout=1.0)
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout waiting for task to cancel: {task.get_name()}")
-        except Exception as e:
-            logger.error(f"Error cancelling task {task.get_name()}: {e}")
+        
+        # Wait for the task to complete with multiple timeout attempts
+        for timeout in [0.5, 1.0, 2.0]:
+            try:
+                await asyncio.wait_for(task, timeout=timeout)
+                break
+            except asyncio.TimeoutError:
+                if timeout == 2.0:  # Last attempt
+                    logger.warning(f"Timeout waiting for task to cancel: {task.get_name()}")
+                continue
+            except asyncio.CancelledError:
+                # Task was successfully cancelled
+                break
+            except Exception as e:
+                logger.error(f"Error cancelling task {task.get_name()}: {e}")
+                break
+                
+    except Exception as e:
+        # Suppress all errors during cleanup
+        logger.debug(f"Suppressed error during task cleanup: {e}")
+    finally:
+        # Ensure task is marked as done
+        if not task.done():
+            logger.warning(f"Task {task.get_name()} still not done after cleanup attempts")
 
 async def cleanup_callback_manager(run_manager: Any) -> None:
     """Safely cleanup a callback manager."""
@@ -153,17 +203,55 @@ async def cleanup():
         # Get all running tasks
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         
-        # First handle langgraph tasks
-        langgraph_tasks = [t for t in tasks if any(name in str(t) for name in ['langgraph', 'researcher', 'agent', 'chain'])]
-        other_tasks = [t for t in tasks if t not in langgraph_tasks]
+        # Categorize tasks
+        langgraph_tasks = []
+        server_tasks = []
+        other_tasks = []
         
+        for task in tasks:
+            task_str = str(task)
+            if any(name in task_str.lower() for name in ['langgraph', 'researcher', 'agent', 'chain', 'pregel']):
+                langgraph_tasks.append(task)
+            elif any(name in task_str.lower() for name in ['server', 'uvicorn', 'http']):
+                server_tasks.append(task)
+            else:
+                other_tasks.append(task)
+        
+        # Clean up langgraph tasks first (most problematic)
         if langgraph_tasks:
             logger.info(f"Cleaning up {len(langgraph_tasks)} langgraph tasks")
-            await asyncio.gather(*[cleanup_langgraph_task(t) for t in langgraph_tasks], return_exceptions=True)
+            cleanup_results = await asyncio.gather(
+                *[cleanup_langgraph_task(t) for t in langgraph_tasks], 
+                return_exceptions=True
+            )
+            for i, result in enumerate(cleanup_results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error cleaning langgraph task {i}: {result}")
         
+        # Clean up other tasks
         if other_tasks:
             logger.info(f"Cleaning up {len(other_tasks)} other tasks")
-            await asyncio.gather(*[cancel_task_with_cleanup(t) for t in other_tasks], return_exceptions=True)
+            cleanup_results = await asyncio.gather(
+                *[cancel_task_with_cleanup(t) for t in other_tasks], 
+                return_exceptions=True
+            )
+            for i, result in enumerate(cleanup_results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error cleaning other task {i}: {result}")
+        
+        # Clean up server tasks last
+        if server_tasks:
+            logger.info(f"Cleaning up {len(server_tasks)} server tasks")
+            cleanup_results = await asyncio.gather(
+                *[cancel_task_with_cleanup(t) for t in server_tasks], 
+                return_exceptions=True
+            )
+            for i, result in enumerate(cleanup_results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error cleaning server task {i}: {result}")
+        
+        # Give a moment for cleanup to complete
+        await asyncio.sleep(0.1)
         
         # Set shutdown event
         shutdown_event.set()
