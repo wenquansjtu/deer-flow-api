@@ -15,6 +15,7 @@ from src.server import app
 from src.graph.builder import build_graph_with_memory
 from contextlib import suppress
 from functools import partial
+from typing import Any, Dict, Optional
 
 # Configure logging
 logging.basicConfig(
@@ -42,6 +43,33 @@ async def cancel_task_with_cleanup(task):
         except Exception as e:
             logger.error(f"Error cancelling task {task.get_name()}: {e}")
 
+async def cleanup_callback_manager(run_manager: Any) -> None:
+    """Safely cleanup a callback manager."""
+    try:
+        if hasattr(run_manager, 'on_chain_end'):
+            # 创建一个空的输出对象
+            empty_output: Dict[str, Any] = {}
+            try:
+                await asyncio.wait_for(
+                    run_manager.on_chain_end(outputs=empty_output), 
+                    timeout=2.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Timeout in callback manager cleanup")
+            except TypeError as e:
+                # 如果 on_chain_end 的签名不匹配，尝试不同的调用方式
+                try:
+                    await asyncio.wait_for(
+                        run_manager.on_chain_end(), 
+                        timeout=2.0
+                    )
+                except Exception as inner_e:
+                    logger.error(f"Error in alternative callback cleanup: {inner_e}")
+            except Exception as e:
+                logger.error(f"Error in callback cleanup: {e}")
+    except Exception as e:
+        logger.error(f"Error accessing callback manager: {e}")
+
 async def cleanup_langgraph_task(task):
     """Specially handle langgraph task cleanup."""
     if task.done():
@@ -53,21 +81,32 @@ async def cleanup_langgraph_task(task):
             coro = task.get_coro()
             if hasattr(coro, 'cr_frame') and hasattr(coro.cr_frame, 'f_locals'):
                 locals_dict = coro.cr_frame.f_locals
+                
+                # 尝试获取和清理所有可能的回调管理器
+                managers_to_cleanup = []
+                
+                # 直接的 run_manager
                 if 'run_manager' in locals_dict:
-                    run_manager = locals_dict['run_manager']
-                    # 确保回调管理器的事件循环仍然可用
-                    if hasattr(run_manager, 'on_chain_end'):
-                        try:
-                            await asyncio.wait_for(run_manager.on_chain_end(), timeout=2.0)
-                        except asyncio.TimeoutError:
-                            logger.warning("Timeout waiting for chain end callback")
-                        except Exception as e:
-                            logger.error(f"Error in chain end callback: {e}")
+                    managers_to_cleanup.append(locals_dict['run_manager'])
+                
+                # 检查 task.proc 中的回调管理器
+                if hasattr(task, 'proc'):
+                    proc = task.proc
+                    if hasattr(proc, 'callbacks'):
+                        managers_to_cleanup.append(proc.callbacks)
+                    if hasattr(proc, 'callback_manager'):
+                        managers_to_cleanup.append(proc.callback_manager)
+                
+                # 清理所有找到的回调管理器
+                for manager in managers_to_cleanup:
+                    if manager:
+                        await cleanup_callback_manager(manager)
+                
     except Exception as e:
         logger.error(f"Error cleaning up langgraph callbacks: {e}")
-    
-    # Then cancel the task
-    await cancel_task_with_cleanup(task)
+    finally:
+        # 无论如何都要取消任务
+        await cancel_task_with_cleanup(task)
 
 async def cleanup():
     """Cleanup function to handle graceful shutdown"""
@@ -78,7 +117,7 @@ async def cleanup():
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         
         # First handle langgraph tasks
-        langgraph_tasks = [t for t in tasks if 'langgraph' in str(t) or 'researcher' in str(t)]
+        langgraph_tasks = [t for t in tasks if any(name in str(t) for name in ['langgraph', 'researcher', 'agent', 'chain'])]
         other_tasks = [t for t in tasks if t not in langgraph_tasks]
         
         if langgraph_tasks:
