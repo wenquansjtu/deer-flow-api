@@ -68,11 +68,13 @@ async def run_agent_workflow_async(
                         "args": ["mcp-github-trending"],
                         "enabled_tools": ["get_github_trending_repositories"],
                         "add_to_agents": ["researcher"],
+                        "timeout_seconds": 30
                     }
                 }
             },
         },
         "recursion_limit": 100,
+        "timeout_seconds": 60
     }
     last_message_cnt = 0
     async for s in graph.astream(
@@ -91,6 +93,10 @@ async def run_agent_workflow_async(
             else:
                 # For any other output format
                 print(f"Output: {s}")
+        except asyncio.CancelledError:
+            logger.warning("Task was cancelled - cleaning up resources")
+            # Add cleanup code here if needed
+            raise
         except Exception as e:
             logger.error(f"Error processing stream output: {e}")
             print(f"Error processing output: {str(e)}")

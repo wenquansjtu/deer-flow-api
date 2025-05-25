@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from typing import Annotated, Literal
+import asyncio
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -409,26 +410,14 @@ async def _setup_and_execute_agent_step(
     agent_type: str,
     default_tools: list,
 ) -> Command[Literal["research_team"]]:
-    """Helper function to set up an agent with appropriate tools and execute a step.
-
-    This function handles the common logic for both researcher_node and coder_node:
-    1. Configures MCP servers and tools based on agent type
-    2. Creates an agent with the appropriate tools or uses the default agent
-    3. Executes the agent on the current step
-
-    Args:
-        state: The current state
-        config: The runnable config
-        agent_type: The type of agent ("researcher" or "coder")
-        default_tools: The default tools to add to the agent
-
-    Returns:
-        Command to update state and go to research_team
-    """
+    """Helper function to set up an agent with appropriate tools and execute a step."""
     configurable = Configuration.from_runnable_config(config)
     mcp_servers = {}
     enabled_tools = {}
-
+    
+    max_retries = 3
+    retry_delay = 1  # seconds
+    
     # Extract MCP server configuration for this agent type
     if configurable.mcp_settings:
         for server_name, server_config in configurable.mcp_settings["servers"].items():
@@ -436,30 +425,49 @@ async def _setup_and_execute_agent_step(
                 server_config["enabled_tools"]
                 and agent_type in server_config["add_to_agents"]
             ):
-                mcp_servers[server_name] = {
+                server_config_copy = {
                     k: v
                     for k, v in server_config.items()
                     if k in ("transport", "command", "args", "url", "env")
                 }
+                # Add default timeout if not specified
+                if "timeout_seconds" not in server_config_copy:
+                    server_config_copy["timeout_seconds"] = 30
+                
+                mcp_servers[server_name] = server_config_copy
                 for tool_name in server_config["enabled_tools"]:
                     enabled_tools[tool_name] = server_name
 
-    # Create and execute agent with MCP tools if available
-    if mcp_servers:
-        async with MultiServerMCPClient(mcp_servers) as client:
-            loaded_tools = default_tools[:]
-            for tool in client.get_tools():
-                if tool.name in enabled_tools:
-                    tool.description = (
-                        f"Powered by '{enabled_tools[tool.name]}'.\n{tool.description}"
-                    )
-                    loaded_tools.append(tool)
-            agent = create_agent(agent_type, agent_type, loaded_tools, agent_type)
-            return await _execute_agent_step(state, agent, agent_type)
-    else:
-        # Use default tools if no MCP servers are configured
-        agent = create_agent(agent_type, agent_type, default_tools, agent_type)
-        return await _execute_agent_step(state, agent, agent_type)
+    # Add retry logic for MCP client setup
+    for retry in range(max_retries):
+        try:
+            async with MultiServerMCPClient(mcp_servers) as client:
+                # 修改这里，直接使用 client.tools 而不是 await client.get_tools()
+                tools = client.tools if hasattr(client, 'tools') else []
+                loaded_tools = default_tools[:]
+                for tool in tools:
+                    if tool.name in enabled_tools:
+                        tool.description = (
+                            f"Powered by '{enabled_tools[tool.name]}'.\n{tool.description}"
+                        )
+                        loaded_tools.append(tool)
+                agent = create_agent(agent_type, agent_type, loaded_tools, agent_type)
+                return await _execute_agent_step(state, agent, agent_type)
+        except FileNotFoundError as e:
+            if "npx" in str(e):
+                logger.error("npx not found. Please ensure Node.js and npm are installed correctly")
+                raise
+            if retry < max_retries - 1:
+                logger.warning(f"Attempt {retry + 1} failed, retrying in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+                continue
+            raise
+        except Exception as e:
+            if retry < max_retries - 1:
+                logger.warning(f"Attempt {retry + 1} failed: {e}, retrying in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+                continue
+            raise
 
 
 async def researcher_node(
