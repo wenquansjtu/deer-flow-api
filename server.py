@@ -13,6 +13,7 @@ import sys
 import uvicorn
 from src.server import app
 from src.graph.builder import build_graph_with_memory
+from contextlib import suppress
 
 # Configure logging
 logging.basicConfig(
@@ -25,6 +26,41 @@ logger = logging.getLogger(__name__)
 # Global flag to track shutdown state
 is_shutting_down = False
 
+async def cancel_task_with_cleanup(task):
+    """Cancel a task and wait for it to complete with proper cleanup."""
+    if task.done():
+        return
+    
+    with suppress(asyncio.CancelledError):
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=1.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout waiting for task to cancel: {task.get_name()}")
+        except Exception as e:
+            logger.error(f"Error cancelling task {task.get_name()}: {e}")
+
+async def cleanup_langgraph_task(task):
+    """Specially handle langgraph task cleanup."""
+    if task.done():
+        return
+
+    try:
+        # Try to get the underlying callback manager if it exists
+        if hasattr(task, 'get_coro'):
+            coro = task.get_coro()
+            if hasattr(coro, 'cr_frame') and hasattr(coro.cr_frame, 'f_locals'):
+                locals_dict = coro.cr_frame.f_locals
+                if 'run_manager' in locals_dict:
+                    run_manager = locals_dict['run_manager']
+                    if hasattr(run_manager, 'on_chain_end'):
+                        await run_manager.on_chain_end()
+    except Exception as e:
+        logger.error(f"Error cleaning up langgraph callbacks: {e}")
+    
+    # Then cancel the task
+    await cancel_task_with_cleanup(task)
+
 async def cleanup():
     """Cleanup function to handle graceful shutdown"""
     logger.info("Starting cleanup...")
@@ -32,37 +68,17 @@ async def cleanup():
     # Get all running tasks
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
     
-    # First, try to gracefully stop langgraph tasks
-    for task in tasks:
-        if 'langgraph' in str(task):
-            try:
-                # Set a flag or state to indicate shutdown
-                if hasattr(task, 'cancel'):
-                    task.cancel()
-                # Wait a short time for the task to clean up
-                try:
-                    await asyncio.wait_for(task, timeout=2.0)
-                except asyncio.TimeoutError:
-                    logger.warning(f"Timeout waiting for langgraph task to cleanup: {task}")
-            except Exception as e:
-                logger.error(f"Error cleaning up langgraph task: {e}")
+    # First handle langgraph tasks
+    langgraph_tasks = [t for t in tasks if 'langgraph' in str(t) or 'researcher' in str(t)]
+    other_tasks = [t for t in tasks if t not in langgraph_tasks]
     
-    # Then cancel remaining tasks
-    remaining_tasks = [t for t in tasks if not t.done()]
-    if remaining_tasks:
-        logger.info(f"Cancelling {len(remaining_tasks)} outstanding tasks")
-        for task in remaining_tasks:
-            if not task.done():
-                task.cancel()
-        
-        # Wait for all tasks to complete with a timeout
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*remaining_tasks, return_exceptions=True),
-                timeout=5.0
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Timeout waiting for tasks to cancel")
+    if langgraph_tasks:
+        logger.info(f"Cleaning up {len(langgraph_tasks)} langgraph tasks")
+        await asyncio.gather(*[cleanup_langgraph_task(t) for t in langgraph_tasks], return_exceptions=True)
+    
+    if other_tasks:
+        logger.info(f"Cleaning up {len(other_tasks)} other tasks")
+        await asyncio.gather(*[cancel_task_with_cleanup(t) for t in other_tasks], return_exceptions=True)
     
     logger.info("Cleanup completed")
 
@@ -76,12 +92,26 @@ async def shutdown():
     logger.info("Starting graceful shutdown...")
     
     try:
-        await cleanup()
+        # Ensure we have an event loop
+        loop = asyncio.get_running_loop()
+        
+        # Set a reasonable timeout for the entire shutdown process
+        try:
+            await asyncio.wait_for(cleanup(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("Cleanup timed out after 10 seconds")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+        
+        # Give pending tasks a final chance to complete
+        pending = [t for t in asyncio.all_tasks() if not t.done() and t is not asyncio.current_task()]
+        if pending:
+            logger.warning(f"{len(pending)} tasks still pending after cleanup")
     except Exception as e:
-        logger.error(f"Error during cleanup: {e}")
+        logger.error(f"Error during shutdown: {e}")
     finally:
-        # Force exit after cleanup
-        sys.exit(0)
+        # Use loop.stop() instead of sys.exit() to allow for cleaner shutdown
+        loop.stop()
 
 def handle_shutdown(signum, frame):
     """Handle graceful shutdown on SIGTERM/SIGINT"""
