@@ -31,21 +31,28 @@ def patch_futures_dict():
     try:
         from langgraph.pregel.runner import FuturesDict
         
-        original_on_done = FuturesDict.on_done
-        
         def safe_on_done(self, task, exception):
             """Safe version of on_done that handles None callbacks."""
             try:
-                if self.callback is not None and callable(self.callback):
-                    return original_on_done(self, task, exception)
+                # Check if callback exists and is callable
+                if hasattr(self, 'callback') and self.callback is not None and callable(self.callback):
+                    # Call the callback safely
+                    try:
+                        self.callback(task, exception)
+                    except Exception as callback_error:
+                        logger.error(f"Error in callback execution: {callback_error}")
                 else:
                     # If callback is None or not callable, just log and return
                     logger.debug("Skipping None or non-callable callback in FuturesDict.on_done")
-                    return
+                    
+                # Always return None to prevent further issues
+                return None
+                    
             except Exception as e:
                 logger.error(f"Error in FuturesDict.on_done: {e}")
-                return
+                return None
         
+        # Replace the method entirely
         FuturesDict.on_done = safe_on_done
         logger.info("Successfully patched FuturesDict.on_done")
         
