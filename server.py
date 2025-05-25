@@ -44,15 +44,21 @@ def patch_futures_dict():
                             # WeakMethod typically only takes the task
                             self.callback(task)
                         else:
-                            # Try with both arguments first
+                            # For other callback types, try different argument patterns
                             try:
+                                # First try with task and exception
                                 self.callback(task, exception)
                             except TypeError as te:
                                 # If that fails, try with just the task
-                                if "takes 1 positional argument but" in str(te):
+                                if "positional argument" in str(te):
                                     self.callback(task)
                                 else:
-                                    raise te
+                                    # Try calling with no arguments
+                                    try:
+                                        self.callback()
+                                    except TypeError:
+                                        # If all else fails, just log the error
+                                        logger.error(f"Could not determine callback signature: {te}")
                     except Exception as callback_error:
                         logger.error(f"Error in callback execution: {callback_error}")
                 else:
