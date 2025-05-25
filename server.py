@@ -17,6 +17,14 @@ from contextlib import suppress
 from functools import partial
 from typing import Any, Dict, Optional
 
+# Configure logging first
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+
+logger = logging.getLogger(__name__)
+
 # Monkey patch to fix FuturesDict callback issue
 def patch_futures_dict():
     """Patch FuturesDict to handle None callbacks gracefully."""
@@ -48,14 +56,6 @@ def patch_futures_dict():
 
 # Apply the patch early
 patch_futures_dict()
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-
-logger = logging.getLogger(__name__)
 
 # Global flag to track shutdown state
 is_shutting_down = False
