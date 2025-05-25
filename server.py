@@ -14,6 +14,7 @@ import uvicorn
 from src.server import app
 from src.graph.builder import build_graph_with_memory
 from contextlib import suppress
+from functools import partial
 
 # Configure logging
 logging.basicConfig(
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Global flag to track shutdown state
 is_shutting_down = False
+shutdown_event = asyncio.Event()
 
 async def cancel_task_with_cleanup(task):
     """Cancel a task and wait for it to complete with proper cleanup."""
@@ -53,8 +55,14 @@ async def cleanup_langgraph_task(task):
                 locals_dict = coro.cr_frame.f_locals
                 if 'run_manager' in locals_dict:
                     run_manager = locals_dict['run_manager']
+                    # 确保回调管理器的事件循环仍然可用
                     if hasattr(run_manager, 'on_chain_end'):
-                        await run_manager.on_chain_end()
+                        try:
+                            await asyncio.wait_for(run_manager.on_chain_end(), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            logger.warning("Timeout waiting for chain end callback")
+                        except Exception as e:
+                            logger.error(f"Error in chain end callback: {e}")
     except Exception as e:
         logger.error(f"Error cleaning up langgraph callbacks: {e}")
     
@@ -65,37 +73,47 @@ async def cleanup():
     """Cleanup function to handle graceful shutdown"""
     logger.info("Starting cleanup...")
     
-    # Get all running tasks
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    
-    # First handle langgraph tasks
-    langgraph_tasks = [t for t in tasks if 'langgraph' in str(t) or 'researcher' in str(t)]
-    other_tasks = [t for t in tasks if t not in langgraph_tasks]
-    
-    if langgraph_tasks:
-        logger.info(f"Cleaning up {len(langgraph_tasks)} langgraph tasks")
-        await asyncio.gather(*[cleanup_langgraph_task(t) for t in langgraph_tasks], return_exceptions=True)
-    
-    if other_tasks:
-        logger.info(f"Cleaning up {len(other_tasks)} other tasks")
-        await asyncio.gather(*[cancel_task_with_cleanup(t) for t in other_tasks], return_exceptions=True)
-    
-    logger.info("Cleanup completed")
+    try:
+        # Get all running tasks
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        
+        # First handle langgraph tasks
+        langgraph_tasks = [t for t in tasks if 'langgraph' in str(t) or 'researcher' in str(t)]
+        other_tasks = [t for t in tasks if t not in langgraph_tasks]
+        
+        if langgraph_tasks:
+            logger.info(f"Cleaning up {len(langgraph_tasks)} langgraph tasks")
+            await asyncio.gather(*[cleanup_langgraph_task(t) for t in langgraph_tasks], return_exceptions=True)
+        
+        if other_tasks:
+            logger.info(f"Cleaning up {len(other_tasks)} other tasks")
+            await asyncio.gather(*[cancel_task_with_cleanup(t) for t in other_tasks], return_exceptions=True)
+        
+        # Set shutdown event
+        shutdown_event.set()
+        
+        logger.info("Cleanup completed")
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+        shutdown_event.set()
 
-async def shutdown():
+async def shutdown(app, signal_=None):
     """Coordinated shutdown function"""
     global is_shutting_down
     if is_shutting_down:
         return
     
     is_shutting_down = True
+    if signal_:
+        logger.info(f"Received exit signal {signal_.name}")
+    
     logger.info("Starting graceful shutdown...")
     
     try:
-        # Ensure we have an event loop
+        # 确保我们有一个事件循环
         loop = asyncio.get_running_loop()
         
-        # Set a reasonable timeout for the entire shutdown process
+        # 设置合理的超时时间
         try:
             await asyncio.wait_for(cleanup(), timeout=10.0)
         except asyncio.TimeoutError:
@@ -103,15 +121,30 @@ async def shutdown():
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
         
-        # Give pending tasks a final chance to complete
+        # 等待所有回调完成
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("Timeout waiting for shutdown event")
+        
+        # 给剩余任务最后的完成机会
         pending = [t for t in asyncio.all_tasks() if not t.done() and t is not asyncio.current_task()]
         if pending:
             logger.warning(f"{len(pending)} tasks still pending after cleanup")
+            
+        # 停止接受新的连接
+        if hasattr(app, 'state'):
+            app.state.should_exit = True
+            
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
     finally:
-        # Use loop.stop() instead of sys.exit() to allow for cleaner shutdown
-        loop.stop()
+        # 使用事件循环的stop而不是直接退出
+        try:
+            loop = asyncio.get_running_loop()
+            loop.stop()
+        except Exception as e:
+            logger.error(f"Error stopping event loop: {e}")
 
 def handle_shutdown(signum, frame):
     """Handle graceful shutdown on SIGTERM/SIGINT"""
@@ -119,21 +152,22 @@ def handle_shutdown(signum, frame):
         logger.warning("Received second shutdown signal, forcing exit...")
         sys.exit(1)
     
-    logger.info("Received shutdown signal. Starting graceful shutdown...")
+    logger.info(f"Received shutdown signal {signal.Signals(signum).name}")
     
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            loop.create_task(shutdown())
+            shutdown_coro = shutdown(app, signal.Signals(signum))
+            asyncio.run_coroutine_threadsafe(shutdown_coro, loop)
         else:
-            loop.run_until_complete(shutdown())
+            loop.run_until_complete(shutdown(app, signal.Signals(signum)))
     except Exception as e:
         logger.error(f"Error initiating shutdown: {e}")
         sys.exit(1)
 
 # Register signal handlers
-signal.signal(signal.SIGTERM, handle_shutdown)
-signal.signal(signal.SIGINT, handle_shutdown)
+for sig in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(sig, handle_shutdown)
 
 if __name__ == "__main__":
     # Parse command line arguments
@@ -172,13 +206,19 @@ if __name__ == "__main__":
 
     try:
         logger.info(f"Starting DeerFlow API server on {args.host}:{args.port}")
-        uvicorn.run(
+        
+        # 配置关闭处理器
+        config = uvicorn.Config(
             "src.server:app",
             host=args.host,
             port=args.port,
             reload=reload,
             log_level=args.log_level,
+            callback_manager=None
         )
+        
+        server = uvicorn.Server(config)
+        server.run()
     except Exception as e:
         logger.error(f"Failed to start server: {str(e)}")
         sys.exit(1)
